@@ -6,28 +6,24 @@ Available Endpoints:
     GET /health              - Health check endpoint
     GET /api/random-quote    - Sample endpoint to connect Frontend and Backend (generates random quote using Gemini LLM)
 
-Database:
-    - Locally sqlite:///./products.db when DATABASE_URL is unset
-    - In production (Render), set DATABASE_URL to a PostgreSQL URI:
-      postgresql://user:password@host:port/dbname
+To run this server:
+    uvicorn main:app --reload
 
-To run:
-    uvicorn main:app --reload                 # dev
-    uvicorn main:app --host 0.0.0.0 --port $PORT  # prod (Render)
+The server will start at: http://localhost:8000
+API documentation will be available at: http://localhost:8000/docs
 
 Setup:
-    1. pip install -r requirements.txt
-    2. Create a .env file with necessary variables:
-         GOOGLE_API_KEY=...
-         DATABASE_URL=postgresql://user:pass@host:port/dbname
-    3. Run uvicorn as above.
+    1. Install dependencies: pip install -r requirements.txt
+    2. Get your Google API key from: https://makersuite.google.com/app/apikey
+    3. Create a .env file in the Backend directory with: GOOGLE_API_KEY=your_api_key_here
+    4. Run the server: uvicorn main:app --reload
 """
 
 import os
-from typing import Any, Optional, cast
-from datetime import datetime, timezone
-
-from fastapi import FastAPI, HTTPException, Depends
+import sqlite3
+from contextlib import asynccontextmanager
+from typing import Any, Optional
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from pydantic import BaseModel
@@ -35,53 +31,128 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
 import json
 
-from sqlalchemy.orm import Session
-from sqlalchemy import or_
-from database import SessionLocal, engine, Base
-import models
-
-
-# load environment variables from .env
+# Load environment variables from .env file
 load_dotenv()
 
-# create tables (works for both sqlite & postgres)
-Base.metadata.create_all(bind=engine)
-
-# initialize Google AI – environment variable should contain your API key.
-# we look for LLM_API_KEY for clarity; older documentation may refer to
-# "GOOGLE_API_KEY" which is functionally equivalent.
-api_key = os.getenv("LLM_API_KEY") or os.getenv("GOOGLE_API_KEY")
+# Initialize API key
+api_key = os.getenv("LLM_API_KEY") or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
 if not api_key:
     print("Warning: LLM_API_KEY (or GOOGLE_API_KEY) not found in environment variables.")
     print("Please create a .env file with: LLM_API_KEY=your_api_key_here")
     genai_configured = False
 else:
-    # Note: api_key is passed directly to ChatGoogleGenerativeAI instances and genai.GenerativeModel.
-    # We don't use genai.configure() as it's a private API.
+    # api_key is passed directly to ChatGoogleGenerativeAI instances
     genai_configured = True
 
-app = FastAPI(title="Backend API", version="0.1.0")
-
-# CORS configuration
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # TODO: restrict to Netlify domain in production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# Initialize LLM clients
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash-lite",
+    temperature=0.7,
+    api_key=api_key,
 )
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
+    # Startup
+    create_products_table()
+    create_descriptions_table()
+    migrate_descriptions_analysis_columns()
+    yield
+    # Shutdown (if needed)
 
-def get_db():
-    """FastAPI dependency that yields a SQLAlchemy session."""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+app = FastAPI(title="Backend API", version="0.1.0", lifespan=lifespan)
+# Enable CORS (Cross-Origin Resource Sharing) to allow frontend to connect
+# This is necessary because the frontend runs on a different port than the backend
+# Without CORS, browsers will block requests from frontend to backend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://localhost:3000","https://productgenai.netlify.app"],  # Vite default port and common React port
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all HTTP methods (GET, POST, PUT, DELETE, etc.)
+    allow_headers=["*"],  # Allows all headers
+)
+
+# Database location can be configured via environment variables on Render.
+# For SQLite deployments you can set DB_PATH to a writable path like
+# "/scratch/data/products.db" or use the default "/tmp/products.db".
+# If you attach a managed database you could also set DATABASE_URL and
+# switch to a different driver later.
+DB_PATH = os.getenv("DB_PATH", "/tmp/products.db")
+
+def get_db():  # type: ignore[no-untyped-def]
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-# Pydantic schemas for request validation
+def create_products_table():  # type: ignore[no-untyped-def]
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            specs TEXT NOT NULL,
+            features TEXT NOT NULL,
+            category TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def create_descriptions_table():  # type: ignore[no-untyped-def]
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS descriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER NOT NULL,
+            description TEXT NOT NULL,
+            tone TEXT NOT NULL,
+            language TEXT NOT NULL,
+            keywords TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (product_id) REFERENCES products(id)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def migrate_descriptions_analysis_columns():  # type: ignore[no-untyped-def]
+    conn = get_db()
+    cursor = conn.cursor()
+
+    columns = [
+        ("quality_score", "INTEGER"),
+        ("seo_score", "INTEGER"),
+        ("engagement_score", "INTEGER"),
+        ("conversion_score", "INTEGER"),
+        ("overall_score", "REAL"),
+        ("analysis_notes", "TEXT"),
+        ("analyzed_at", "TIMESTAMP"),
+    ]
+
+    # Get existing columns
+    cursor.execute("PRAGMA table_info(descriptions)")
+    existing_columns = [col[1] for col in cursor.fetchall()]
+
+    # Add missing columns safely
+    for column_name, column_type in columns:
+        if column_name not in existing_columns:
+            cursor.execute(
+                f"ALTER TABLE descriptions ADD COLUMN {column_name} {column_type}"
+            )
+
+    conn.commit()
+    conn.close()
+
+
+# create_products_table()
+# create_descriptions_table()
+# migrate_descriptions_analysis_columns()
+
+
 class ProductCreate(BaseModel):
     user_id: str
     name: str
@@ -89,261 +160,327 @@ class ProductCreate(BaseModel):
     features: str
     category: str
 
-
 class ProductUpdate(BaseModel):
     name: str
     specs: str
     features: str
-
 
 class DescriptionGenerateRequest(BaseModel):
     tone: str
     language: str
     num_variations: int = 3
 
+def insert_product(product: ProductCreate):
+    conn = get_db()
+    cursor = conn.cursor()
 
-# Database helper functions using SQLAlchemy ORM
-
-def insert_product(db: Session, product: ProductCreate) -> int:
-    db_product = models.Product(
-        user_id=product.user_id,
-        name=product.name,
-        specs=product.specs,
-        features=product.features,
-        category=product.category,
+    cursor.execute(
+        """
+        INSERT INTO products (user_id, name, specs, features, category)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            product.user_id,
+            product.name,
+            product.specs,
+            product.features,
+            product.category,
+        )
     )
-    db.add(db_product)
-    db.commit()
-    db.refresh(db_product)
-    return db_product.id
 
+    conn.commit()
+    product_id = cursor.lastrowid
+    conn.close()
 
-def get_product_by_id(db: Session, product_id: int) -> models.Product | None:
-    return db.query(models.Product).filter(models.Product.id == product_id).first()
+    return product_id
 
+def get_product_by_id(product_id: int):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM products WHERE id = ?", (product_id,))
+    product = cursor.fetchone()
+    conn.close()
+    return product
 
-def get_description_by_id(db: Session, description_id: int) -> models.Description | None:
-    return db.query(models.Description).filter(models.Description.id == description_id).first()
+def get_description_by_id(description_id: int):
+    conn = get_db()
+    cursor = conn.cursor()
 
+    cursor.execute(
+        "SELECT * FROM descriptions WHERE id = ?",
+        (description_id,)
+    )
+    description = cursor.fetchone()
+
+    conn.close()
+    return description
 
 def save_description_analysis(
-    db: Session,
     description_id: int,
     quality_score: int,
     seo_score: int,
     engagement_score: int,
     conversion_score: int,
     overall_score: float,
-    analysis_notes: str,
-) -> models.Description | None:
-    desc = db.query(models.Description).filter(models.Description.id == description_id).first()
-    if not desc:
-        return None
-    desc.quality_score = quality_score
-    desc.seo_score = seo_score
-    desc.engagement_score = engagement_score
-    desc.conversion_score = conversion_score
-    desc.overall_score = overall_score
-    desc.analysis_notes = analysis_notes
-    desc.analyzed_at = datetime.now(timezone.utc)
-    db.commit()
-    return desc
+    analysis_notes: str
+):
+    conn = get_db()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        UPDATE descriptions
+        SET quality_score = ?,
+            seo_score = ?,
+            engagement_score = ?,
+            conversion_score = ?,
+            overall_score = ?,
+            analysis_notes = ?,
+            analyzed_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (
+            quality_score,
+            seo_score,
+            engagement_score,
+            conversion_score,
+            overall_score,
+            analysis_notes,
+            description_id,
+        )
+    )
+
+    conn.commit()
+    conn.close()
 
 
-def analyze_description_with_llm(description_text: str) -> dict[str, Any]:
+def analyze_description_with_llm(description_text: str) -> dict[str, Any]:  # type: ignore[no-untyped-def]
     response = analysis_llm.invoke(
         analysis_prompt.format(description=description_text)
     )
-    # response.content can be str or list; convert to string  # type: ignore[arg-type]
+
+    # response.content can be str or list; convert to string
     raw = str(response.content).strip()  # type: ignore[arg-type]
+
+    # extract JSON only
     start = raw.find("{")
     end = raw.rfind("}") + 1
+
     if start == -1 or end == -1:
         raise ValueError(f"No JSON found. Raw output: {raw}")
+
     json_str = raw[start:end]
+
     data = json.loads(json_str)
+
     quality = int(data["quality"])
     seo = int(data["seo"])
     engagement = int(data["engagement"])
     conversion = int(data["conversion"])
     notes = data.get("notes", "")
+
     overall = round((quality + seo + engagement + conversion) / 4, 2)
-    return {
+
+    return {  # type: ignore[return-value]
         "quality": quality,
         "seo": seo,
         "engagement": engagement,
         "conversion": conversion,
         "overall": overall,
-        "notes": notes,
+        "notes": notes
     }
 
+def get_analyzed_descriptions_by_product(product_id: int) -> list[dict[str, Any]]:  # type: ignore[no-untyped-def]
+    conn = get_db()
+    cursor = conn.cursor()
 
-def get_analyzed_descriptions_by_product(db: Session, product_id: int) -> list[dict[str, Any]]:
-    descs = (
-        db.query(models.Description)
-        .filter(
-            models.Description.product_id == product_id,
-            models.Description.overall_score.isnot(None),
-        )
-        .order_by(models.Description.overall_score.desc())
-        .all()
+    cursor.execute(
+        """
+        SELECT id,
+               quality_score,
+               seo_score,
+               engagement_score,
+               conversion_score,
+               overall_score,
+               analysis_notes
+        FROM descriptions
+        WHERE product_id = ?
+          AND overall_score IS NOT NULL
+        ORDER BY overall_score DESC
+        """,
+        (product_id,)
     )
-    return [
-        {
-            "id": d.id,
-            "quality_score": d.quality_score,
-            "seo_score": d.seo_score,
-            "engagement_score": d.engagement_score,
-            "conversion_score": d.conversion_score,
-            "overall_score": d.overall_score,
-            "analysis_notes": d.analysis_notes,
-        }
-        for d in descs
-    ]
 
+    rows = cursor.fetchall()
+    conn.close()
 
-def calculate_analysis_averages(descriptions: list[dict[str, Any]]) -> dict[str, float]:
-    total: dict[str, float] = {"quality": 0.0, "seo": 0.0, "engagement": 0.0, "conversion": 0.0, "overall": 0.0}
+    return [dict(r) for r in rows]
+
+def calculate_analysis_averages(descriptions: list[dict[str, Any]]) -> dict[str, float]:  # type: ignore[no-untyped-def]
+    total: dict[str, float] = {
+        "quality": 0.0,
+        "seo": 0.0,
+        "engagement": 0.0,
+        "conversion": 0.0,
+        "overall": 0.0,
+    }
+
     count = len(descriptions)
+
     for d in descriptions:
         total["quality"] += d["quality_score"]
         total["seo"] += d["seo_score"]
         total["engagement"] += d["engagement_score"]
         total["conversion"] += d["conversion_score"]
         total["overall"] += d["overall_score"]
-    return {k: round(v / count, 2) for k, v in total.items()}
+
+    return {
+        k: round(v / count, 2) for k, v in total.items()
+    }
 
 
-def get_products_by_user(db: Session, user_id: str) -> list[tuple[int, str, str]]:
-    result = (
-        db.query(models.Product.id, models.Product.name, models.Product.category)
-        .filter(models.Product.user_id == user_id)
-        .order_by(models.Product.id.desc())
-        .all()
+
+def get_products_by_user(user_id: str) -> list[Any]:  # type: ignore[no-untyped-def]
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, name, category
+        FROM products
+        WHERE user_id = ?
+        ORDER BY id DESC
+        """,
+        (user_id,)
     )
-    # SQLAlchemy Row objects are tuple-like; cast to plain tuples for type compatibility
-    return cast(list[tuple[int, str, str]], result)
+    products = cursor.fetchall()
+    conn.close()
+    return products
 
+def search_products(user_id: str, query: str, category: Optional[str]) -> list[Any]:  # type: ignore[no-untyped-def]
+    conn = get_db()
+    cursor = conn.cursor()
 
-def search_products(db: Session, user_id: str, query: str, category: Optional[str]) -> list[tuple[int, str, str]]:
-    q = (
-        db.query(models.Product.id, models.Product.name, models.Product.category)
-        .filter(models.Product.user_id == user_id)
-        .filter(
-            or_(
-                models.Product.name.ilike(f"%{query}%"),
-                models.Product.specs.ilike(f"%{query}%"),
-                models.Product.features.ilike(f"%{query}%"),
-            )
-        )
-    )
+    sql = """
+        SELECT id, name, category
+        FROM products
+        WHERE user_id = ?
+          AND (
+            name LIKE ?
+            OR specs LIKE ?
+            OR features LIKE ?
+          )
+    """
+
+    params: list[Any] = [  # type: ignore[assignment]
+        user_id,
+        f"%{query}%",
+        f"%{query}%",
+        f"%{query}%"
+    ]
+
     if category:
-        q = q.filter(models.Product.category == category)
-    result = q.order_by(models.Product.id.desc()).all()
-    # SQLAlchemy Row objects are tuple-like; cast to plain tuples for type compatibility
-    return cast(list[tuple[int, str, str]], result)
+        sql += " AND category = ?"
+        params.append(category)
+
+    sql += " ORDER BY id DESC"
+
+    cursor.execute(sql, params)
+    rows = cursor.fetchall()
+    conn.close()
+
+    return [dict(r) for r in rows]
 
 
-def save_description(
-    db: Session,
-    product_id: int,
-    description: str,
-    tone: str,
-    language: str,
-    keywords: Optional[str] = None,
-) -> models.Description:
-    db_desc = models.Description(
-        product_id=product_id,
-        description=description,
-        tone=tone,
-        language=language,
-        keywords=keywords,
+def save_description(product_id: int, description: str, tone: str, language: str, keywords: Optional[str]) -> None:  # type: ignore[no-untyped-def]
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO descriptions (product_id, description, tone, language, keywords)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (product_id, description, tone, language, keywords)
     )
-    db.add(db_desc)
-    db.commit()
-    db.refresh(db_desc)
-    return db_desc
+    conn.commit()
+    conn.close()
 
+def get_product_with_descriptions(product_id: int) -> dict[str, Any] | None:  # type: ignore[no-untyped-def]
+    conn = get_db()
+    cursor = conn.cursor()
 
-def get_product_with_descriptions(db: Session, product_id: int) -> dict[str, Any] | None:
-    prod = db.query(models.Product).filter(models.Product.id == product_id).first()
-    if not prod:
+    # Get product
+    cursor.execute("SELECT * FROM products WHERE id = ?", (product_id,))
+    product = cursor.fetchone()
+
+    if not product:
+        conn.close()
         return None
-    return {
-        "product": {
-            "id": prod.id,
-            "user_id": prod.user_id,
-            "name": prod.name,
-            "specs": prod.specs,
-            "features": prod.features,
-            "category": prod.category,
-        },
-        "descriptions": [
-            {
-                "id": d.id,
-                "description": d.description,
-                "tone": d.tone,
-                "language": d.language,
-                "keywords": d.keywords,
-                "created_at": d.created_at,
-                "quality_score": d.quality_score,
-                "seo_score": d.seo_score,
-                "engagement_score": d.engagement_score,
-                "conversion_score": d.conversion_score,
-                "overall_score": d.overall_score,
-                "analysis_notes": d.analysis_notes,
-                "analyzed_at": d.analyzed_at,
-            }
-            for d in prod.descriptions
-        ],
+
+    # Get descriptions
+    cursor.execute(
+        "SELECT * FROM descriptions WHERE product_id = ? ORDER BY created_at DESC",
+        (product_id,)
+    )
+    descriptions = cursor.fetchall()
+
+    conn.close()
+
+    return {  # type: ignore[return-value]
+        "product": dict(product),
+        "descriptions": [dict(d) for d in descriptions]
     }
 
-
-def update_product(db: Session, product_id: int, name: str, specs: str, features: str) -> int:
-    prod = db.query(models.Product).filter(models.Product.id == product_id).first()
-    if not prod:
-        return 0
-    prod.name = name
-    prod.specs = specs
-    prod.features = features
-    db.commit()
-    return 1
-
-
-def delete_product_and_descriptions(db: Session, product_id: int, user_id: str) -> bool:
-    prod = (
-        db.query(models.Product)
-        .filter(models.Product.id == product_id, models.Product.user_id == user_id)
-        .first()
+def update_product(product_id: int, name: str, specs: str, features: str):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE products
+        SET name = ?, specs = ?, features = ?
+        WHERE id = ?
+        """,
+        (name, specs, features, product_id)
     )
-    if not prod:
+    conn.commit()
+    rows = cursor.rowcount
+    conn.close()
+    return rows
+
+def delete_product_and_descriptions(product_id: int, user_id: str):
+    conn = get_db()
+    cursor = conn.cursor()
+
+    # Verify product belongs to user
+    cursor.execute(
+        "SELECT id FROM products WHERE id = ? AND user_id = ?",
+        (product_id, user_id)
+    )
+    product = cursor.fetchone()
+
+    if not product:
+        conn.close()
         return False
-    db.delete(prod)
-    db.commit()
+
+    # Delete descriptions first
+    cursor.execute(
+        "DELETE FROM descriptions WHERE product_id = ?",
+        (product_id,)
+    )
+
+    # Delete product
+    cursor.execute(
+        "DELETE FROM products WHERE id = ?",
+        (product_id,)
+    )
+
+    conn.commit()
+    conn.close()
     return True
-
-
-def get_product_specs_for_keywords(db: Session, product_id: int) -> dict[str, str] | None:
-    prod = db.query(models.Product).filter(models.Product.id == product_id).first()
-    if not prod:
-        return None
-    return {
-        "name": prod.name,
-        "specs": prod.specs,
-        "features": prod.features,
-        "category": prod.category,
-    }
-
-
-# supply API key explicitly so the class doesn’t rely on a specific
-# environment variable name (it understands GOOGLE_API_KEY/GEMINI_API_KEY).
-# our code prefers LLM_API_KEY for clarity, so forward that value here.
-api_val = os.getenv("LLM_API_KEY") or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
 
 llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash-lite",
     temperature=0.7,
-    api_key=api_val,
+    google_api_key=os.getenv("LLM_API_KEY")
 )
 
 description_prompt = PromptTemplate(
@@ -365,12 +502,7 @@ Requirements:
 """
 )
 
-def generate_descriptions(
-    product: dict[str, str],
-    tone: str,
-    language: str,
-    num_variations: int,
-) -> list[str]:
+def generate_descriptions(product: dict[str, str], tone: str, language: str, num_variations: int) -> list[str]:  # type: ignore[no-untyped-def]
     results: list[str] = []
 
     for _ in range(num_variations):
@@ -384,11 +516,31 @@ def generate_descriptions(
         )
 
         response = llm.invoke(prompt)
-        # response.content can be str or list; convert to string  # type: ignore[arg-type]
+        # response.content can be str or list; convert to string
         results.append(str(response.content).strip())  # type: ignore[arg-type]
 
     return results
 
+def get_product_specs_for_keywords(product_id: int) -> dict[str, str] | None:  # type: ignore[no-untyped-def]
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT name, specs, features, category
+        FROM products
+        WHERE id = ?
+    """, (product_id,))
+    product = cursor.fetchone()
+    conn.close()
+
+    if not product:
+        return None
+
+    return {  # type: ignore[return-value]
+        "name": product["name"],
+        "specs": product["specs"],
+        "features": product["features"],
+        "category": product["category"],
+    }
 
 keyword_prompt = PromptTemplate(
     input_variables=["name", "category", "specs", "features"],
@@ -414,7 +566,7 @@ Features: {features}
 keyword_llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash-lite",
     temperature=0.3,
-    api_key=api_val,
+    api_key=api_key,
 )
 
 analysis_prompt = PromptTemplate(
@@ -438,31 +590,54 @@ Description:
 """
 )
 
+
+
+
 analysis_llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash-lite",
     temperature=0.0,
-    api_key=api_val,
+    api_key=api_key,
 )
 
 
-def extract_seo_keywords(product_data: dict[str, str]) -> list[str]:
+def extract_seo_keywords(product_data: dict[str, str]) -> list[str]:  # type: ignore[no-untyped-def]
     prompt = keyword_prompt.format(**product_data)
     response = keyword_llm.invoke(prompt)
-    # response.content can be str or list; convert to string  # type: ignore[arg-type]
+    # response.content can be str or list; convert to string
     return [k.strip() for k in str(response.content).split(",") if k.strip()]  # type: ignore[arg-type]
 
+@app.post("/api/products/{product_id}/keywords")
+async def extract_product_keywords(product_id: int) -> dict[str, Any]:  # type: ignore[no-untyped-def]
+    try:
+        product = get_product_specs_for_keywords(product_id)
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
 
+        keywords = extract_seo_keywords(product)
+        return {  # type: ignore[return-value]
+            "success": True,
+            "count": len(keywords),
+            "keywords": keywords
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Keyword extraction failed: {str(e)}"
+        )
 
 @app.get("/")
-async def root():
+async def root() -> dict[str, str]:  # type: ignore[no-untyped-def]
     return {"message": "Hello from AI Interviewer Backend!"}
 
 @app.get("/health")
-async def health_check():
+async def health_check() -> dict[str, str]:  # type: ignore[no-untyped-def]
     return {"status": "healthy"}
 
 @app.get("/api/random-quote")
-async def get_random_quote():  # type: ignore[no-untyped-def]
+async def get_random_quote() -> dict[str, Any]:  # type: ignore[no-untyped-def]
     """
     Sample endpoint to connect Frontend and Backend.
     This is a simple example endpoint that generates a random inspirational quote using Google's Gemini LLM.
@@ -481,7 +656,7 @@ async def get_random_quote():  # type: ignore[no-untyped-def]
         # Use ChatGoogleGenerativeAI to generate a random quote
         quote_llm = ChatGoogleGenerativeAI(
             model='gemini-2.5-flash',
-            api_key=api_val,
+            api_key=api_key,
         )
         response = quote_llm.invoke("Tell me a random inspirational quote")
         quote_text = str(response.content).strip()  # type: ignore[arg-type]
@@ -501,7 +676,7 @@ async def get_random_quote():  # type: ignore[no-untyped-def]
 
 
 @app.post("/api/products")
-async def create_product(product: ProductCreate, db: Session = Depends(get_db)):  # type: ignore[no-untyped-def]
+async def create_product(product: ProductCreate) -> dict[str, Any]:  # type: ignore[no-untyped-def]
 
     # Extra safety validation
     if not all([
@@ -517,9 +692,9 @@ async def create_product(product: ProductCreate, db: Session = Depends(get_db)):
         )
 
     try:
-        product_id = insert_product(db, product)
+        product_id = insert_product(product)
 
-        return {  # type: ignore[return-value]
+        return {
             "success": True,
             "message": "Product created successfully",
             "data": {
@@ -539,21 +714,21 @@ async def create_product(product: ProductCreate, db: Session = Depends(get_db)):
         )
 
 @app.get("/api/products")
-async def get_user_products(user_id: str, db: Session = Depends(get_db)):  # type: ignore[no-untyped-def]
+async def get_user_products(user_id: str) -> dict[str, Any]:  # type: ignore[no-untyped-def]
     if not user_id:
         raise HTTPException(status_code=400, detail="User ID is required")
 
     try:
-        products = get_products_by_user(db, user_id)
+        products = get_products_by_user(user_id)
 
-        return {  # type: ignore[return-value]
+        return {
             "success": True,
             "count": len(products),
             "data": [
                 {
-                    "id": p[0],
-                    "name": p[1],
-                    "category": p[2]
+                    "id": p["id"],
+                    "name": p["name"],
+                    "category": p["category"]
                     
                 }
                 for p in products
@@ -564,19 +739,18 @@ async def get_user_products(user_id: str, db: Session = Depends(get_db)):  # typ
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/products/search")
-async def search_products_api(  # type: ignore[no-untyped-def]
+async def search_products_api(
     user_id: str,
     query: str,
-    category: str | None = None,
-    db: Session = Depends(get_db),
-):
+    category: Optional[str] = None
+) -> dict[str, Any]:  # type: ignore[no-untyped-def]
     if not query:
         raise HTTPException(status_code=400, detail="Search query is required")
 
     try:
-        results = search_products(db, user_id, query, category)
+        results = search_products(user_id, query, category)
 
-        return {  # type: ignore[return-value]
+        return {
             "success": True,
             "count": len(results),
             "data": results
@@ -590,14 +764,14 @@ async def search_products_api(  # type: ignore[no-untyped-def]
 
 
 @app.get("/api/products/{product_id}")
-async def get_product_detail(product_id: int, db: Session = Depends(get_db)):  # type: ignore[no-untyped-def]
+async def get_product_detail(product_id: int) -> dict[str, Any]:  # type: ignore[no-untyped-def]
     try:
-        data = get_product_with_descriptions(db, product_id)
+        data = get_product_with_descriptions(product_id)
 
         if not data:
             raise HTTPException(status_code=404, detail="Product not found")
 
-        return {  # type: ignore[return-value]
+        return {
             "success": True,
             "data": data
         }
@@ -609,13 +783,12 @@ async def get_product_detail(product_id: int, db: Session = Depends(get_db)):  #
         )
 
 @app.patch("/api/products/{product_id}")
-async def update_product_api(product_id: int, product: ProductUpdate, db: Session = Depends(get_db)):  # type: ignore[no-untyped-def]
-    existing = get_product_by_id(db, product_id)
+async def update_product_api(product_id: int, product: ProductUpdate) -> dict[str, Any]:  # type: ignore[no-untyped-def]
+    existing = get_product_by_id(product_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Product not found")
 
     rows = update_product(
-        db,
         product_id,
         product.name,
         product.specs,
@@ -625,7 +798,7 @@ async def update_product_api(product_id: int, product: ProductUpdate, db: Sessio
     if rows == 0:
         raise HTTPException(status_code=400, detail="Update failed")
 
-    return {  # type: ignore[return-value]
+    return {
         "success": True,
         "message": "Product updated successfully",
         "data": {
@@ -637,9 +810,9 @@ async def update_product_api(product_id: int, product: ProductUpdate, db: Sessio
     }
 
 @app.delete("/api/products/{product_id}")
-async def delete_product(product_id: int, user_id: str, db: Session = Depends(get_db)):  # type: ignore[no-untyped-def]
+async def delete_product(product_id: int, user_id: str) -> dict[str, Any]:  # type: ignore[no-untyped-def]
     try:
-        deleted = delete_product_and_descriptions(db, product_id, user_id)
+        deleted = delete_product_and_descriptions(product_id, user_id)
 
         if not deleted:
             raise HTTPException(
@@ -647,7 +820,7 @@ async def delete_product(product_id: int, user_id: str, db: Session = Depends(ge
                 detail="Product not found or unauthorized"
             )
 
-        return {  # type: ignore[return-value]
+        return {
             "success": True,
             "message": "Product deleted successfully"
         }
@@ -659,38 +832,29 @@ async def delete_product(product_id: int, user_id: str, db: Session = Depends(ge
         )
 
 @app.post("/api/products/{product_id}/generate")
-async def generate_product_descriptions(  # type: ignore[no-untyped-def]
+async def generate_product_descriptions(
     product_id: int,
-    request: DescriptionGenerateRequest,
-    db: Session = Depends(get_db),
-):
-    product_obj = get_product_by_id(db, product_id)
+    request: DescriptionGenerateRequest
+) -> dict[str, Any]:  # type: ignore[no-untyped-def]
+    product = get_product_by_id(product_id)
 
-    if not product_obj:
+    if not product:
         raise HTTPException(status_code=404, detail="Product not found")
-
-    product_data = {
-        "name": product_obj.name,
-        "category": product_obj.category,
-        "specs": product_obj.specs,
-        "features": product_obj.features,
-    }
 
     try:
         variations = min(request.num_variations, 5)
 
         descriptions = generate_descriptions(
-            product=product_data,
+            product=product,
             tone=request.tone,
             language=request.language,
             num_variations=variations
         )
 
-        response_data: list[dict[str, Any]] = []  # type: ignore[assignment]
+        response_data: list[dict[str, str]] = []
 
         for desc in descriptions:
             save_description(
-                db,
                 product_id=product_id,
                 description=desc,
                 tone=request.tone,
@@ -704,7 +868,7 @@ async def generate_product_descriptions(  # type: ignore[no-untyped-def]
                 "language": request.language
             })
 
-        return {  # type: ignore[return-value]
+        return {
             "success": True,
             "count": len(response_data),
             "descriptions": response_data
@@ -723,19 +887,19 @@ async def generate_product_descriptions(  # type: ignore[no-untyped-def]
         )
 
 @app.post("/api/products/{product_id}/descriptions/{desc_id}/analyze")
-async def analyze_description_endpoint(product_id: int, desc_id: int, db: Session = Depends(get_db)):  # type: ignore[no-untyped-def]
+async def analyze_description_endpoint(product_id: int, desc_id: int) -> dict[str, Any]:  # type: ignore[no-untyped-def]
     try:
         # 1. Fetch description
-        description_obj = get_description_by_id(db, desc_id)
+        description = get_description_by_id(desc_id)
 
-        if not description_obj:
+        if not description:
             raise HTTPException(
                 status_code=404,
                 detail="Description not found"
             )
 
         # Optional safety check (description belongs to product)
-        if description_obj.product_id != product_id:
+        if description["product_id"] != product_id:
             raise HTTPException(
                 status_code=400,
                 detail="Description does not belong to this product"
@@ -743,12 +907,11 @@ async def analyze_description_endpoint(product_id: int, desc_id: int, db: Sessio
 
         # 2. Analyze using LLM
         analysis = analyze_description_with_llm(
-            description_obj.description
+            description["description"]
         )
 
         # 3. Save analysis results
         save_description_analysis(
-            db,
             description_id=desc_id,
             quality_score=analysis["quality"],
             seo_score=analysis["seo"],
@@ -759,7 +922,7 @@ async def analyze_description_endpoint(product_id: int, desc_id: int, db: Sessio
         )
 
         # 4. Return analysis
-        return {  # type: ignore[return-value]
+        return {
             "success": True,
             "description_id": desc_id,
             "analysis": analysis
@@ -779,9 +942,9 @@ async def analyze_description_endpoint(product_id: int, desc_id: int, db: Sessio
         )
 
 @app.post("/api/products/{product_id}/compare-descriptions")
-async def compare_descriptions(product_id: int, db: Session = Depends(get_db)):  # type: ignore[no-untyped-def]
+async def compare_descriptions(product_id: int) -> dict[str, Any]:  # type: ignore[no-untyped-def]
     try:
-        analyzed = get_analyzed_descriptions_by_product(db, product_id)
+        analyzed = get_analyzed_descriptions_by_product(product_id)
 
         if not analyzed:
             raise HTTPException(
@@ -791,7 +954,7 @@ async def compare_descriptions(product_id: int, db: Session = Depends(get_db)): 
 
         best = analyzed[0]
 
-        return {  # type: ignore[return-value]
+        return {
             "success": True,
             "count": len(analyzed),
             "best_description_id": best["id"],
@@ -807,9 +970,9 @@ async def compare_descriptions(product_id: int, db: Session = Depends(get_db)): 
         )
 
 @app.get("/api/products/{product_id}/analytics")
-async def get_product_analytics(product_id: int, db: Session = Depends(get_db)):  # type: ignore[no-untyped-def]
+async def get_product_analytics(product_id: int) -> dict[str, Any]:  # type: ignore[no-untyped-def]
     try:
-        analyzed = get_analyzed_descriptions_by_product(db, product_id)
+        analyzed = get_analyzed_descriptions_by_product(product_id)
 
         if not analyzed:
             raise HTTPException(
@@ -820,7 +983,7 @@ async def get_product_analytics(product_id: int, db: Session = Depends(get_db)):
         averages = calculate_analysis_averages(analyzed)
         best = analyzed[0]
 
-        return {  # type: ignore[return-value]
+        return {
             "success": True,
             "count": len(analyzed),
             "best_description_id": best["id"],
@@ -835,13 +998,4 @@ async def get_product_analytics(product_id: int, db: Session = Depends(get_db)):
             status_code=500,
             detail=f"Analytics fetch failed: {str(e)}"
         )
-
-
-@app.post("/api/products/{product_id}/keywords")
-async def extract_product_keywords(product_id: int, db: Session = Depends(get_db)):  # type: ignore[no-untyped-def]
-    product = get_product_specs_for_keywords(db, product_id)
-    if not product:
-        raise HTTPException(status_code=404, detail="Product not found")
-    keywords = extract_seo_keywords(product)
-    return {"success": True, "keywords": keywords}  # type: ignore[return-value]
 

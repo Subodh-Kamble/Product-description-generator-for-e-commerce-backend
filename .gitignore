@@ -8,12 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
-venv/
 .env
-# local sqlite storage
 Backend/products.db
 *.db
-.env.example
 
 
 
