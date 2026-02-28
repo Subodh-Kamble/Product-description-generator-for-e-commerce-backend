@@ -66,7 +66,12 @@ app = FastAPI(title="Backend API", version="0.1.0", lifespan=lifespan)
 # Without CORS, browsers will block requests from frontend to backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000","https://productgenai.netlify.app"],  # Vite default port and common React port
+    allow_origins=[
+        "http://localhost:5173", 
+        "http://localhost:3000",
+        "https://productgenai.netlify.app",
+        "https://aiproductdescription.netlify.app"
+    ],  # Vite default port and common React port
     allow_credentials=True,
     allow_methods=["*"],  # Allows all HTTP methods (GET, POST, PUT, DELETE, etc.)
     allow_headers=["*"],  # Allows all headers

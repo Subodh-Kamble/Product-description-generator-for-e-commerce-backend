@@ -11,6 +11,6 @@ wheels/
 .env
 Backend/products.db
 *.db
-.env.example
+
 
 
