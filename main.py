@@ -24,6 +24,9 @@ Setup:
 """
 
 import os
+from typing import Any, Optional
+from datetime import datetime, timezone
+
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 import google.generativeai as genai
@@ -32,15 +35,12 @@ from pydantic import BaseModel
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
 import json
-import re
-from typing import List, Optional
-from datetime import datetime
 
-# SQLAlchemy imports
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 from database import SessionLocal, engine, Base
 import models
+
 
 # load environment variables from .env
 load_dotenv()
@@ -104,7 +104,7 @@ class DescriptionGenerateRequest(BaseModel):
 
 # Database helper functions using SQLAlchemy ORM
 
-def insert_product(db: Session, product: ProductCreate):
+def insert_product(db: Session, product: ProductCreate) -> int:
     db_product = models.Product(
         user_id=product.user_id,
         name=product.name,
@@ -118,11 +118,11 @@ def insert_product(db: Session, product: ProductCreate):
     return db_product.id
 
 
-def get_product_by_id(db: Session, product_id: int):
+def get_product_by_id(db: Session, product_id: int) -> models.Product | None:
     return db.query(models.Product).filter(models.Product.id == product_id).first()
 
 
-def get_description_by_id(db: Session, description_id: int):
+def get_description_by_id(db: Session, description_id: int) -> models.Description | None:
     return db.query(models.Description).filter(models.Description.id == description_id).first()
 
 
@@ -135,7 +135,7 @@ def save_description_analysis(
     conversion_score: int,
     overall_score: float,
     analysis_notes: str,
-):
+) -> models.Description | None:
     desc = db.query(models.Description).filter(models.Description.id == description_id).first()
     if not desc:
         return None
@@ -145,12 +145,12 @@ def save_description_analysis(
     desc.conversion_score = conversion_score
     desc.overall_score = overall_score
     desc.analysis_notes = analysis_notes
-    desc.analyzed_at = datetime.utcnow()
+    desc.analyzed_at = datetime.now(timezone.utc)
     db.commit()
     return desc
 
 
-def analyze_description_with_llm(description_text: str):
+def analyze_description_with_llm(description_text: str) -> dict[str, Any]:
     response = analysis_llm.invoke(
         analysis_prompt.format(description=description_text)
     )
@@ -177,12 +177,12 @@ def analyze_description_with_llm(description_text: str):
     }
 
 
-def get_analyzed_descriptions_by_product(db: Session, product_id: int):
+def get_analyzed_descriptions_by_product(db: Session, product_id: int) -> list[dict[str, Any]]:
     descs = (
         db.query(models.Description)
         .filter(
             models.Description.product_id == product_id,
-            models.Description.overall_score != None,
+            models.Description.overall_score.isnot(None),
         )
         .order_by(models.Description.overall_score.desc())
         .all()
@@ -201,8 +201,8 @@ def get_analyzed_descriptions_by_product(db: Session, product_id: int):
     ]
 
 
-def calculate_analysis_averages(descriptions: list):
-    total = {"quality": 0, "seo": 0, "engagement": 0, "conversion": 0, "overall": 0}
+def calculate_analysis_averages(descriptions: list[dict[str, Any]]) -> dict[str, float]:
+    total: dict[str, float] = {"quality": 0.0, "seo": 0.0, "engagement": 0.0, "conversion": 0.0, "overall": 0.0}
     count = len(descriptions)
     for d in descriptions:
         total["quality"] += d["quality_score"]
@@ -213,7 +213,7 @@ def calculate_analysis_averages(descriptions: list):
     return {k: round(v / count, 2) for k, v in total.items()}
 
 
-def get_products_by_user(db: Session, user_id: str):
+def get_products_by_user(db: Session, user_id: str) -> list[tuple[int, str, str]]:
     return (
         db.query(models.Product.id, models.Product.name, models.Product.category)
         .filter(models.Product.user_id == user_id)
@@ -222,7 +222,7 @@ def get_products_by_user(db: Session, user_id: str):
     )
 
 
-def search_products(db: Session, user_id: str, query: str, category: Optional[str]):
+def search_products(db: Session, user_id: str, query: str, category: Optional[str]) -> list[tuple[int, str, str]]:
     q = (
         db.query(models.Product.id, models.Product.name, models.Product.category)
         .filter(models.Product.user_id == user_id)
@@ -239,7 +239,14 @@ def search_products(db: Session, user_id: str, query: str, category: Optional[st
     return q.order_by(models.Product.id.desc()).all()
 
 
-def save_description(db: Session, product_id: int, description: str, tone: str, language: str, keywords: str = None):
+def save_description(
+    db: Session,
+    product_id: int,
+    description: str,
+    tone: str,
+    language: str,
+    keywords: Optional[str] = None,
+) -> models.Description:
     db_desc = models.Description(
         product_id=product_id,
         description=description,
@@ -253,7 +260,7 @@ def save_description(db: Session, product_id: int, description: str, tone: str, 
     return db_desc
 
 
-def get_product_with_descriptions(db: Session, product_id: int):
+def get_product_with_descriptions(db: Session, product_id: int) -> dict[str, Any] | None:
     prod = db.query(models.Product).filter(models.Product.id == product_id).first()
     if not prod:
         return None
@@ -287,7 +294,7 @@ def get_product_with_descriptions(db: Session, product_id: int):
     }
 
 
-def update_product(db: Session, product_id: int, name: str, specs: str, features: str):
+def update_product(db: Session, product_id: int, name: str, specs: str, features: str) -> int:
     prod = db.query(models.Product).filter(models.Product.id == product_id).first()
     if not prod:
         return 0
@@ -298,7 +305,7 @@ def update_product(db: Session, product_id: int, name: str, specs: str, features
     return 1
 
 
-def delete_product_and_descriptions(db: Session, product_id: int, user_id: str):
+def delete_product_and_descriptions(db: Session, product_id: int, user_id: str) -> bool:
     prod = (
         db.query(models.Product)
         .filter(models.Product.id == product_id, models.Product.user_id == user_id)
@@ -311,7 +318,7 @@ def delete_product_and_descriptions(db: Session, product_id: int, user_id: str):
     return True
 
 
-def get_product_specs_for_keywords(db: Session, product_id: int):
+def get_product_specs_for_keywords(db: Session, product_id: int) -> dict[str, str] | None:
     prod = db.query(models.Product).filter(models.Product.id == product_id).first()
     if not prod:
         return None
@@ -322,9 +329,16 @@ def get_product_specs_for_keywords(db: Session, product_id: int):
         "category": prod.category,
     }
 
+
+# supply API key explicitly so the class doesn’t rely on a specific
+# environment variable name (it understands GOOGLE_API_KEY/GEMINI_API_KEY).
+# our code prefers LLM_API_KEY for clarity, so forward that value here.
+api_val = os.getenv("LLM_API_KEY") or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+
 llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash-lite",
-    temperature=0.7
+    temperature=0.7,
+    api_key=api_val,
 )
 
 description_prompt = PromptTemplate(
@@ -346,8 +360,13 @@ Requirements:
 """
 )
 
-def generate_descriptions(product, tone, language, num_variations):
-    results = []
+def generate_descriptions(
+    product: dict[str, str],
+    tone: str,
+    language: str,
+    num_variations: int,
+) -> list[str]:
+    results: list[str] = []
 
     for _ in range(num_variations):
         prompt = description_prompt.format(
@@ -364,26 +383,6 @@ def generate_descriptions(product, tone, language, num_variations):
 
     return results
 
-def get_product_specs_for_keywords(product_id: int):
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT name, specs, features, category
-        FROM products
-        WHERE id = ?
-    """, (product_id,))
-    product = cursor.fetchone()
-    conn.close()
-
-    if not product:
-        return None
-
-    return {
-        "name": product["name"],
-        "specs": product["specs"],
-        "features": product["features"],
-        "category": product["category"],
-    }
 
 keyword_prompt = PromptTemplate(
     input_variables=["name", "category", "specs", "features"],
@@ -408,7 +407,8 @@ Features: {features}
 
 keyword_llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash-lite",
-    temperature=0.3
+    temperature=0.3,
+    api_key=api_val,
 )
 
 analysis_prompt = PromptTemplate(
@@ -432,19 +432,19 @@ Description:
 """
 )
 
-
-
-
 analysis_llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash-lite",
-    temperature=0.0
+    temperature=0.0,
+    api_key=api_val,
 )
 
 
-def extract_seo_keywords(product_data: dict):
+def extract_seo_keywords(product_data: dict[str, str]) -> list[str]:
     prompt = keyword_prompt.format(**product_data)
     response = keyword_llm.invoke(prompt)
     return [k.strip() for k in response.content.split(",") if k.strip()]
+
+
 
 @app.get("/")
 async def root():
